@@ -1,13 +1,14 @@
-AC_INIT([corkscrew],[2.0])
+AC_INIT(corkscrew, 2.0)
 AC_CONFIG_SRCDIR(corkscrew.c)
-AM_INIT_AUTOMAKE
 AM_CONFIG_HEADER(config.h:config.in)
-#AM_C_PROTOTYPES
+AM_INIT_AUTOMAKE
 
 AC_PROG_CC
 AC_PROG_AWK
 AC_PROG_INSTALL
 AC_PROG_LN_S
+
+AC_ARG_ENABLE([ssl], AS_HELP_STRING([--enable-ssl], [Enable SSL connections to the proxy server]))
 
 AC_CANONICAL_HOST
 case "$host_os" in
@@ -22,13 +23,20 @@ esac
 
 AC_HEADER_STDC
 AC_HEADER_TIME
-dnl AC_CHECK_HEADERS(fcntl.h sys/ioctl.h sys/time.h unistd.h arpa/inet.h errno.h netdb.h netinet/in.h stdio.h stdlib.h string.h sys/socket.h sys/types.h)
-
-dnl AC_CHECK_TYPE
-
 AC_CHECK_FUNCS(select socket strerror)
+
 dnl check for working const (hpux)
 AC_C_CONST
 
-AC_CONFIG_FILES([Makefile])
-AC_OUTPUT
+AM_CONDITIONAL([SSL], [test "x$enable_ssl" = "xyes"])
+AS_IF([test "x$enable_ssl" = "xyes"], [PKG_CHECK_MODULES([SSL], [openssl >= 1.0.0])])
+
+AC_CHECK_TYPE([struct addrinfo], [have_addrinfo=yes], [], [[#include <netdb.h>]])
+AM_CONDITIONAL([IPV6], [test "x$have_addrinfo" = "xyes"])
+
+AC_CHECK_MEMBER([struct hostent.h_addr],
+		[AC_DEFINE([HAVE_H_ADDR], [1],
+			   [Define to 1 if struct hostent contains the h_addr member.])],
+		[], [[#include <netdb.h>]])
+
+AC_OUTPUT(Makefile)

@@ -1,40 +1,19 @@
-#include "config.h"
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#if HAVE_SYS_FILIO_H
-#include <sys/filio.h>
-#endif
+#include "corkscrew.h"
 
-#if __STDC__
-#  ifndef NOPROTOS
-#    define PARAMS(args)      args
-#  endif
-#endif
-#ifndef PARAMS
-#  define PARAMS(args)        ()
-#endif
+const static char linefeed[] = "\r\n\r\n";
+struct args_st args;
 
-char *base64_encodei PARAMS((char *in));
-void usage PARAMS((void));
-int sock_connect PARAMS((const char *hname, int port));
-int main PARAMS((int argc, char *argv[]));
-
-#define BUFSIZE 4096
-/*
-char linefeed[] = "\x0A\x0D\x0A\x0D";
-*/
-char linefeed[] = "\r\n\r\n"; /* it is better and tested with oops & squid */
+void usage PARAMS(());
+void parse_args PARAMS((int argc, char *argv[]));
+void expect_arg_param PARAMS((char *argv));
 
 /*
 ** base64.c
@@ -55,7 +34,7 @@ char *in;
 	char *buf, *ret;
 
 	unsigned int tmp;
-	
+
 	int i,len;
 
 	len = strlen(in);
@@ -70,7 +49,6 @@ char *in;
 	if (!buf)
 		return NULL;
 	ret = buf;
-
 
 	for (src = in; src < end - 3;) {
 		tmp = *src++ << 24;
@@ -122,46 +100,6 @@ char *in;
 }
 
 #ifdef ANSI_FUNC
-void usage (void)
-#else
-void usage ()
-#endif
-{
-	printf("corkscrew %s (agroman@agroman.net)\n\n", VERSION);
-	printf("usage: corkscrew <proxyhost> <proxyport> <desthost> <destport> [authfile]\n");
-}
-
-#ifdef ANSI_FUNC
-int sock_connect (const char *hname, int port)
-#else
-int sock_connect (hname, port)
-const char *hname;
-int port;
-#endif
-{
-	int fd;
-	struct sockaddr_in addr;
-	struct hostent *hent;
-
-	fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd == -1)
-		return -1;
-
-	hent = gethostbyname(hname);
-	if (hent == NULL)
-		addr.sin_addr.s_addr = inet_addr(hname);
-	else
-		memcpy(&addr.sin_addr, hent->h_addr, hent->h_length);
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(port);
-	
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)))
-		return -1;
-
-	return fd;
-}
-
-#ifdef ANSI_FUNC
 int main (int argc, char *argv[])
 #else
 int main (argc, argv)
@@ -169,111 +107,97 @@ int argc;
 char *argv[];
 #endif
 {
-#ifdef ANSI_FUNC
-	char uri[BUFSIZE] = "", buffer[BUFSIZE] = "", version[BUFSIZE] = "", descr[BUFSIZE] = "";
-#else
 	char uri[BUFSIZE], buffer[BUFSIZE], version[BUFSIZE], descr[BUFSIZE];
-#endif
-	char *host = NULL, *desthost = NULL, *destport = NULL;
-	char *up = NULL;
-	int port, sent, setup, code, csock;
+	char line[4096], *up = NULL;
+	CONN csock;
+	int fd, sent, setup, code;
 	fd_set rfd, sfd;
 	struct timeval tv;
 	ssize_t len;
 	FILE *fp;
 
-	port = 80;
+	parse_args(argc, argv);
+	if (!args.authfile) {
+		up = getenv("CORKSCREW_AUTH");
 
-	if ((argc == 5) || (argc == 6)) {
-		if (argc == 5) {
-			host = argv[1];
-			port = atoi(argv[2]);
-			desthost = argv[3];
-			destport = argv[4];
-		}
-		if ((argc == 6)) {
-			host = argv[1];
-			port = atoi(argv[2]);
-			desthost = argv[3];
-			destport = argv[4];
-			fp = fopen(argv[5], "r");
-			if (fp == NULL) {
-				fprintf(stderr, "Error opening %s: %s\n", argv[5], strerror(errno));
-				exit(-1);
-			} else {
-				char line[4096];
-				fscanf(fp, "%s", line);
-				up = malloc(sizeof(line));
-				up = line;
-				fclose(fp);
-			}
-		}
 	} else {
-		usage();
-		exit(-1);
+		fp = fopen(args.authfile, "r");
+		if (fp == NULL) {
+			fprintf(stderr, "Error opening %s: %s\n", args.authfile, strerror(errno));
+			exit(EXIT_FAILURE);
+		} else {
+			if (!fscanf(fp, "%4095s", line)) {
+				fprintf(stderr, "Error reading auth file's content\n");
+				exit(EXIT_FAILURE);
+			}
+			up = line;
+			fclose(fp);
+		}
 	}
 
 	strncpy(uri, "CONNECT ", sizeof(uri));
-	strncat(uri, desthost, sizeof(uri) - strlen(uri) - 1);
+	strncat(uri, args.desthost, sizeof(uri) - strlen(uri) - 1);
 	strncat(uri, ":", sizeof(uri) - strlen(uri) - 1);
-	strncat(uri, destport, sizeof(uri) - strlen(uri) - 1);
+	strncat(uri, args.destport, sizeof(uri) - strlen(uri) - 1);
 	strncat(uri, " HTTP/1.0", sizeof(uri) - strlen(uri) - 1);
-	if ((argc == 6) || (argc == 7)) {
+	if (up != NULL) {
 		strncat(uri, "\nProxy-Authorization: Basic ", sizeof(uri) - strlen(uri) - 1);
 		strncat(uri, base64_encode(up), sizeof(uri) - strlen(uri) - 1);
 	}
 	strncat(uri, linefeed, sizeof(uri) - strlen(uri) - 1);
 
-	csock = sock_connect(host, port);
-	if(csock == -1) {
+	fd = sock_connect(args.host, args.port);
+	if (fd == -1) {
 		fprintf(stderr, "Couldn't establish connection to proxy: %s\n", strerror(errno));
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 
+	csock = conn_init(fd);
 	sent = 0;
 	setup = 0;
 	for(;;) {
 		FD_ZERO(&sfd);
 		FD_ZERO(&rfd);
 		if ((setup == 0) && (sent == 0)) {
-			FD_SET(csock, &sfd);
+			FD_SET(FD(csock), &sfd);
 		}
-		FD_SET(csock, &rfd);
+		FD_SET(FD(csock), &rfd);
 		FD_SET(0, &rfd);
 
 		tv.tv_sec = 5;
 		tv.tv_usec = 0;
 
-		if(select(csock+1,&rfd,&sfd,NULL,&tv) == -1) break;
+		if(select(FD(csock)+1,&rfd,&sfd,NULL,&tv) == -1) break;
 
 		/* there's probably a better way to do this */
 		if (setup == 0) {
-			if (FD_ISSET(csock, &rfd)) {
-				len = read(csock, buffer, sizeof(buffer));
+			if (FD_ISSET(FD(csock), &rfd)) {
+				len = peer_read(csock, buffer, sizeof(buffer));
 				if (len<=0)
 					break;
 				else {
+					memset(descr, 0, sizeof(descr));
 					sscanf(buffer,"%s%d%[^\n]",version,&code,descr);
 					if ((strncmp(version,"HTTP/",5) == 0) && (code >= 200) && (code < 300))
 						setup = 1;
 					else {
 						if ((strncmp(version,"HTTP/",5) == 0) && (code >= 407)) {
 						}
-						fprintf(stderr, "Proxy could not open connnection to %s: %s\n", desthost, descr);
-						exit(-1);
+						fprintf(stderr, "Proxy could not open connection to %s: %s\n", args.desthost, descr);
+						exit(EXIT_FAILURE);
 					}
 				}
 			}
-			if (FD_ISSET(csock, &sfd) && (sent == 0)) {
-				len = write(csock, uri, strlen(uri));
+			if (FD_ISSET(FD(csock), &sfd) && (sent == 0)) {
+				len = peer_write(csock, uri, strlen(uri));
 				if (len<=0)
 					break;
 				else
 					sent = 1;
 			}
 		} else {
-			if (FD_ISSET(csock, &rfd)) {
-				len = read(csock, buffer, sizeof(buffer));
+			if (FD_ISSET(FD(csock), &rfd)) {
+				len = peer_read(csock, buffer, sizeof(buffer));
 				if (len<=0) break;
 				len = write(1, buffer, len);
 				if (len<=0) break;
@@ -282,10 +206,117 @@ char *argv[];
 			if (FD_ISSET(0, &rfd)) {
 				len = read(0, buffer, sizeof(buffer));
 				if (len<=0) break;
-				len = write(csock, buffer, len);
+				len = peer_write(csock, buffer, len);
 				if (len<=0) break;
 			}
 		}
 	}
-	exit(0);
+
+	conn_free(csock);
+	exit(EXIT_SUCCESS);
+}
+
+#ifdef ANSI_FUNC
+void usage (void)
+#else
+void usage ()
+#endif
+{
+	printf("corkscrew %s (agroman@agroman.net)\n\n", VERSION);
+#ifdef USE_SSL
+	printf("usage: corkscrew [-his] [-a authfile] [-c cert]\n");
+	printf("                 <proxyhost> <proxyport> <desthost> <destport>\n");
+#else
+	printf("usage: corkscrew [-h] [-a authfile]\n");
+	printf("                 <proxyhost> <proxyport> <desthost> <destport>\n");
+#endif
+	puts("");
+	printf("  proxyhost\tthe host name of the proxy to use\n");
+	printf("  proxyport\tthe port address of the proxy to use\n");
+	printf("  desthost\tthe host name of the SSH server to connect to\n");
+	printf("  destport\tthe port address of the SSH server to connect to\n");
+	puts("");
+	printf("  -h\t\tdisplay this help message\n");
+	printf("  -a authfile\tspecify a file containing authentication credentials\n");
+
+#ifdef USE_SSL
+	printf("  -i\t\tignore certificates that cannot be verified\n");
+	printf("  -s\t\tenable SSL connection to the proxy\n");
+	printf("  -c cert\tspecify a file containing a trusted CA\n");
+#endif
+	puts("");
+}
+
+#ifdef ANSI_FUNC
+void parse_args (int argc, char *argv[])
+#else
+void parse_args (argc, argv)
+int argc;
+char *argv[];
+#endif
+{
+	int i, j, len;
+	int reqargs; /* required argument count */
+
+	reqargs = argc;
+	for (i = 1; i < argc; i++) {
+		if (argv[i][0] != '-')
+			break;
+
+		len = strlen(&argv[i][1]) + 1;
+		for (j = 1; j < len; j++) {
+			switch (argv[i][j]) {
+			case 'a':
+				expect_arg_param(&argv[i][j]);
+				args.authfile = argv[++i];
+				reqargs -= 2;
+				goto end_inner;
+			case 'h':
+				usage();
+				exit(EXIT_SUCCESS);
+#ifdef USE_SSL
+			case 'c':
+				expect_arg_param(&argv[i][j]);
+				args.trust_ca = argv[++i];
+				reqargs -= 2;
+				goto end_inner;
+			case 'i':
+				args.ignore_certs = 1;
+				break;
+			case 's':
+				args.ssl = 1;
+				break;
+#endif
+			default:
+				usage();
+				exit(EXIT_FAILURE);
+			}
+		}
+
+		reqargs--;
+end_inner: ;
+	}
+
+	if (reqargs < 5) {
+		usage();
+		exit(EXIT_FAILURE);
+	}
+
+	args.host = argv[i++];
+	args.port = argv[i++];
+	args.desthost = argv[i++];
+	args.destport = argv[i++];
+}
+
+#ifdef ANSI_FUNC
+void expect_arg_param (char *argv)
+#else
+void expect_arg_param ()
+char *argv;
+#endif
+{
+	if (argv[1] != '\0') {
+		fprintf(stderr, "Argument '-%c' expects a parameter.\n", argv[0]);
+		exit(EXIT_FAILURE);
+	}
 }
